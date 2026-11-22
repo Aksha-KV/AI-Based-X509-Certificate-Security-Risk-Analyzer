@@ -152,3 +152,8 @@ CT-log lookups, name-constraint and policy validation, certificate-chain graph a
 ## License
 
 MIT - see `LICENSE`.
+
+## Contributors
+- [@aksha2005](https://github.com/aksha2005)
+- [@swatimh-gif](https://github.com/swatimh-gif)
+- [@hdspandana](https://github.com/hdspandana)
