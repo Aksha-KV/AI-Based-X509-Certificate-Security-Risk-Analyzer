@@ -32,6 +32,7 @@ PROTECTED_DOMAINS: Set[str] = {
     "linkedin.com",
     "instagram.com",
     "youtube.com",
+    "msrit.edu",
 }
 
 
