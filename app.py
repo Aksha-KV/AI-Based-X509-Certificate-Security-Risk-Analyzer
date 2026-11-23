@@ -20,7 +20,15 @@ from datetime import datetime, timezone
 import pandas as pd
 import streamlit as st
 
-from analyzer import analyze, fetch_cert_from_domain, parse_cert_from_pem, rows_to_csv, scan_targets
+from analyzer import (
+    analyze,
+    check_typosquatting,
+    fetch_cert_from_domain,
+    parse_cert_from_pem,
+    rows_to_csv,
+    scan_targets,
+    validate_domain,
+)
 from analyzer.ml_model import CertificateAnomalyModel
 from analyzer.report_view import (chain_table, export_json, findings_table, ml_caption,
                                   ml_factors_table)
@@ -54,21 +62,16 @@ def _safe_str(value: object, max_len: int = 500) -> str:
 def _normalize_hostname(raw: str) -> str:
     """
     Normalize a user-supplied hostname/URL to a bare, lowercase domain name.
-
-    Handles inputs like:
-      "  HTTPS://GitHub.com/path/  "  -> "github.com"
-      "github.com"                     -> "github.com"
-      "github.com:443"                 -> "github.com"
-      "HTTP://Example.COM/"            -> "example.com"
-
-    Falls back to simple strip+lower if urlsplit cannot parse a hostname
-    (e.g. plain "github.com" without a scheme is handled via the "//" prefix).
+    Preserves backward compatibility for callers and internal usage.
     """
+    is_valid, host, _ = validate_domain(raw, allow_private=True)
+    if host:
+        return host[:_MAX_DOMAIN_LEN]
+    # Fallback to standard urlsplit stripping if not parsed
     from urllib.parse import urlsplit
     text = raw.strip()
     if not text:
         return ""
-    # Inject a dummy scheme so urlsplit treats it as a netloc, not a path
     if "://" not in text:
         text = "//" + text
     try:
@@ -77,7 +80,6 @@ def _normalize_hostname(raw: str) -> str:
     except Exception:
         host = ""
     if not host:
-        # Last-resort: strip scheme manually and take everything before the first / or :
         host = raw.strip().lower()
         for prefix in ("https://", "http://"):
             if host.startswith(prefix):
@@ -100,6 +102,18 @@ def _safe_domain(raw: str) -> str:
 @st.cache_resource
 def get_model() -> CertificateAnomalyModel:
     return CertificateAnomalyModel()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def get_domain_cert_details(safe_domain: str, port: int, allow_private: bool, verify_tls: bool):
+    """
+    Cache certificate fetch and feature extraction for consistent repeat scans.
+    Expires after 5 minutes or can be cleared via Streamlit cache clear.
+    """
+    _, details = fetch_cert_from_domain(
+        safe_domain, port=port, allow_private=allow_private, verify_tls=verify_tls
+    )
+    return details
 
 
 model = get_model()
@@ -163,15 +177,45 @@ with tab_domain:
             domain, go = name, True
 
     if go and domain:
-        safe_domain = _safe_domain(domain)
-        with st.spinner(f"TLS handshake with {_safe_str(safe_domain)}:{int(port)} ..."):
-            try:
-                _, details = fetch_cert_from_domain(safe_domain, port=int(port), allow_private=allow_private,
-                                                    verify_tls=verify_tls)
-                run_analysis(details, f"Domain: {_safe_str(safe_domain)}:{int(port)}")
-                st.success("Certificate fetched. Open the **Report** tab.")
-            except Exception as exc:
-                st.error(f"❌ {type(exc).__name__}: {_safe_str(str(exc))}")
+        is_valid, safe_domain, val_err = validate_domain(domain, allow_private=allow_private)
+        if not is_valid:
+            st.error(f"❌ {val_err}")
+        else:
+            is_typo, matched_domain, typo_err = check_typosquatting(safe_domain)
+            if is_typo:
+                st.error(f"❌ {typo_err}")
+            else:
+                with st.spinner(f"TLS handshake with {_safe_str(safe_domain)}:{int(port)} ..."):
+                    try:
+                        details = get_domain_cert_details(safe_domain, port=int(port), allow_private=allow_private,
+                                                          verify_tls=verify_tls)
+                        # Check for hostname mismatch or trust-store verification error
+                        tls = details.get("tls") or {}
+                        verify_code = tls.get("verify_code")
+                        is_mismatch = (details.get("hostname_match") is False) or (verify_code == 62)
+
+                        if is_mismatch:
+                            cert_cn = _safe_str(details.get("common_name", "Unknown"))
+                            st.error(
+                                f"❌ **Certificate Hostname Mismatch**: The TLS certificate returned by "
+                                f"`{_safe_str(safe_domain)}:{int(port)}` does not match the requested hostname "
+                                f"'{_safe_str(safe_domain)}' (Certificate CN: `{cert_cn}`)."
+                            )
+                        else:
+                            run_analysis(details, f"Domain: {_safe_str(safe_domain)}:{int(port)}")
+                            st.success("Certificate fetched. Open the **Report** tab.")
+                    except ConnectionError as exc:
+                        st.error(
+                            f"❌ **Connection Failed**: Could not resolve domain or establish connection to "
+                            f"`{_safe_str(safe_domain)}:{int(port)}`. The domain may not exist or is unreachable. ({_safe_str(str(exc))})"
+                        )
+                    except (TimeoutError, socket.timeout) as exc:
+                        st.error(
+                            f"❌ **Connection Timed Out**: Connection to `{_safe_str(safe_domain)}:{int(port)}` timed out. "
+                            f"Check network connectivity or host availability."
+                        )
+                    except Exception as exc:
+                        st.error(f"❌ {type(exc).__name__}: {_safe_str(str(exc))}")
 
 # ----------------------------------------------------------------------------- file
 with tab_file:
@@ -235,7 +279,12 @@ with tab_report:
         cert, rules, ml, final = report["cert"], report["rules"], report["ml"], report["final"]
         # Sanitise certificate fields before rendering
         common_name = _safe_str(cert.get("common_name", "Unknown"))
-        st.markdown(f"### Audit report: `{common_name}`")
+        queried_host = _safe_str(cert.get("hostname") or common_name)
+
+        st.markdown(f"### Audit report: `{queried_host}`")
+        if cert.get("hostname") and cert.get("common_name") and cert.get("hostname").lower() != cert.get("common_name").lower():
+            st.markdown(f"**Certificate CN:** `{common_name}`")
+
         st.caption(f"Source: {_safe_str(st.session_state.source)} · analysed "
                    f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
 

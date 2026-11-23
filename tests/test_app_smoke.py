@@ -22,6 +22,7 @@ def _stub(session):
     st = MagicMock(name="streamlit")
     st.session_state = session
     st.cache_resource = lambda fn: fn
+    st.cache_data = lambda *a, **kw: (lambda fn: fn)
     st.tabs = lambda labels: [MagicMock() for _ in labels]
     st.columns = lambda spec, **kw: [MagicMock() for _ in range(spec if isinstance(spec, int) else len(spec))]
     st.button.return_value = False
